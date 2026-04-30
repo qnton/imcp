@@ -1,0 +1,58 @@
+{
+  "name": "imcp",
+  "version": "0.1.0",
+  "description": "Read-only IMAP Model Context Protocol (MCP) server with local SQLite cache and search",
+  "type": "module",
+  "bin": {
+    "imcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test:mcp": "node scripts/mcp-selftest.mjs --offline-imap",
+    "test:mcp:live": "node scripts/mcp-selftest.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qnton/imcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/qnton/imcp/issues"
+  },
+  "homepage": "https://github.com/qnton/imcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "imap",
+    "email",
+    "imapflow",
+    "sqlite"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.3",
+    "dotenv": "^16.4.7",
+    "imapflow": "^1.1.2",
+    "mailparser": "^3.9.8",
+    "minisearch": "^7.2.0",
+    "sql.js": "^1.13.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.14",
+    "@types/sql.js": "^1.4.11",
+    "typescript": "^5.8.2"
+  }
+}
