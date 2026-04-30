@@ -1,6 +1,6 @@
 ## imcp
 
-Read-only IMAP MCP: mirrors mail into **SQLite (sql.js / WASM)** with an in-memory **MiniSearch** index (SQLite build in sql.js has no FTS5), exposes `**mail_sync`**, `**mail_search**`, `**mail_get**`, `**mail_list_mailboxes**`, `**mail_stats**`. Uses `**EXAMINE` + UID `FETCH**` only (see `mailboxOpen(..., { readOnly: true })`); never `STORE`, `APPEND`, `MOVE`, etc.
+Read-only IMAP MCP: mirrors mail into **SQLite (sql.js / WASM)** with an in-memory **MiniSearch** index (SQLite build in sql.js has no FTS5), exposes `**mail_sync`**, `**mail_search`**, `**mail_get**`, `**mail_list_mailboxes**`, `**mail_stats**`. Uses `**EXAMINE` + UID `FETCH**` only (see `mailboxOpen(..., { readOnly: true })`); never `STORE`, `APPEND`, `MOVE`, etc.
 
 ### Requirements
 
@@ -10,16 +10,8 @@ Read-only IMAP MCP: mirrors mail into **SQLite (sql.js / WASM)** with an in-memo
 
 ### Install
 
-**From npm** (after publish):
-
 ```bash
-npm install -g imap-email-mcp
-```
-
-**From source**:
-
-```bash
-git clone <repo-url> imcp && cd imcp && npm ci && npm run build
+git clone https://github.com/qnton/imcp && cd imcp && npm ci && npm run build
 ```
 
 Create `.env` (see [.env.example](.env.example)). Then point your MCP client at the server.
@@ -75,4 +67,3 @@ After `npm run build`:
 ### Limits
 
 First large sync over IMAP may take time. Use `**MAIL_SYNC_ON_START**` only if startup delay is acceptable, or `**maxMessagesPerFolder**` on `mail_sync` to pace imports.
-
