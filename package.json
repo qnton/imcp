@@ -18,6 +18,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
+    "test:db": "npm run build && node scripts/db-selftest.mjs",
     "test:mcp": "node scripts/mcp-selftest.mjs --offline-imap",
     "test:mcp:live": "node scripts/mcp-selftest.mjs",
     "prepublishOnly": "npm run build"
@@ -43,16 +44,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.3",
+    "better-sqlite3": "^12.9.0",
     "dotenv": "^16.4.7",
     "imapflow": "^1.1.2",
-    "mailparser": "^3.9.8",
-    "minisearch": "^7.2.0",
-    "sql.js": "^1.13.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.13.14",
-    "@types/sql.js": "^1.4.11",
     "typescript": "^5.8.2"
   }
 }

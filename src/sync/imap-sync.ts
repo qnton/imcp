@@ -1,10 +1,13 @@
-import { ImapFlow } from "imapflow";
-import { simpleParser } from "mailparser";
+import { ImapFlow, type FetchMessageObject, type MessageStructureObject } from "imapflow";
+import { text as streamText } from "node:stream/consumers";
 import type { Config } from "../config.js";
 import {
+  beginWrite,
+  commitWrite,
   getFolderByPath,
   insertMessage,
   type MailStore,
+  rollbackWrite,
   setFolderValidityAndResetUid,
   upsertFolder,
 } from "../db/mail-db.js";
@@ -27,7 +30,7 @@ function flagsToString(flags: Set<string> | undefined): string | null {
 function snippetFromText(text: string, max = 240): string {
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length <= max) return t;
-  return `${t.slice(0, max)}…`;
+  return `${t.slice(0, max)}...`;
 }
 
 function normMessageId(mid?: string | null): string | null {
@@ -36,12 +39,138 @@ function normMessageId(mid?: string | null): string | null {
   return t.length ? t : null;
 }
 
+type TextPart = { part: string; contentType: "text/plain" | "text/html"; size: number };
+
+function isAttachment(node: MessageStructureObject): boolean {
+  return node.disposition?.toLowerCase() === "attachment";
+}
+
+function bodyPartScore(part: TextPart): number {
+  return (part.contentType === "text/plain" ? 0 : 10) + Math.min(part.size, 10_000_000) / 10_000_000;
+}
+
+function decodeQuotedPrintable(input: string): Buffer {
+  const normalized = input.replace(/=\r?\n/g, "");
+  const bytes: number[] = [];
+  for (let i = 0; i < normalized.length; i++) {
+    if (
+      normalized[i] === "=" &&
+      i + 2 < normalized.length &&
+      /^[0-9a-f]{2}$/i.test(normalized.slice(i + 1, i + 3))
+    ) {
+      bytes.push(Number.parseInt(normalized.slice(i + 1, i + 3), 16));
+      i += 2;
+    } else {
+      bytes.push(normalized.charCodeAt(i) & 0xff);
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+function decodeText(buffer: Buffer, charset?: string): string {
+  const normalized = charset?.trim().toLowerCase().replace(/^"|"$/g, "");
+  if (normalized === "iso-8859-1" || normalized === "latin1" || normalized === "windows-1252") {
+    return buffer.toString("latin1");
+  }
+  return buffer.toString("utf8");
+}
+
+export function textFromMessageSource(source: Buffer): string {
+  const raw = source.toString("latin1");
+  const split = raw.match(/\r?\n\r?\n/);
+  if (!split?.index) return "";
+
+  const headers = raw.slice(0, split.index);
+  const unfoldedHeaders = headers.replace(/\r?\n[ \t]+/g, " ");
+  const body = raw.slice(split.index + split[0].length);
+  const contentType = unfoldedHeaders.match(/^content-type:\s*([^;\r\n]+)([^\r\n]*)/im);
+  const type = contentType?.[1]?.trim().toLowerCase();
+  if (type && type !== "text/plain") return "";
+
+  const charset = contentType?.[2]?.match(/charset="?([^";\r\n]+)"?/i)?.[1];
+  const encoding = unfoldedHeaders.match(/^content-transfer-encoding:\s*([^\r\n]+)/im)?.[1]?.trim().toLowerCase();
+  const bytes =
+    encoding === "base64"
+      ? Buffer.from(body.replace(/\s+/g, ""), "base64")
+      : encoding === "quoted-printable"
+        ? decodeQuotedPrintable(body)
+        : Buffer.from(body, "latin1");
+
+  return decodeText(bytes, charset).trim();
+}
+
+export function selectTextBodyPart(structure?: MessageStructureObject): TextPart | undefined {
+  if (!structure) return undefined;
+  const parts: TextPart[] = [];
+  const visit = (node: MessageStructureObject): void => {
+    const type = node.type.toLowerCase();
+    const part = node.part ?? (!node.childNodes?.length ? "1" : undefined);
+    if (!isAttachment(node) && part && (type === "text/plain" || type === "text/html")) {
+      parts.push({
+        part,
+        contentType: type,
+        size: Number(node.size ?? 0),
+      });
+    }
+    for (const child of node.childNodes ?? []) visit(child);
+  };
+  visit(structure);
+  return parts.sort((a, b) => bodyPartScore(a) - bodyPartScore(b))[0];
+}
+
+export function htmlToText(html: string): string {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function downloadTextPart(
+  client: ImapFlow,
+  uid: number,
+  part: TextPart,
+  maxBytes: number,
+): Promise<string> {
+  const downloaded = await client.download(String(uid), part.part, { uid: true, maxBytes });
+  if (!downloaded.content) return "";
+  const body = await streamText(downloaded.content);
+  return part.contentType === "text/html" ? htmlToText(body) : body;
+}
+
+async function downloadTextFromSource(
+  client: ImapFlow,
+  uid: number,
+  maxBytes: number,
+): Promise<string> {
+  const msg = await client.fetchOne(String(uid), { source: { start: 0, maxLength: maxBytes } }, { uid: true });
+  const source = msg && "source" in msg ? msg.source : undefined;
+  return source ? textFromMessageSource(source) : "";
+}
+
 export type SyncResult = {
   mailboxes: string[];
   folders_synced: number;
   messages_imported: number;
   errors: string[];
 };
+
+export function newestFetchedMessages(
+  messages: FetchMessageObject[],
+  maxMessages: number,
+): FetchMessageObject[] {
+  if (maxMessages <= 0 || messages.length <= maxMessages) return messages;
+  return messages.slice(-maxMessages);
+}
 
 export async function syncMailboxes(
   cfg: Config,
@@ -103,35 +232,63 @@ export async function syncMailboxes(
 
         const lastUid = folderRow.last_uid;
         let maxUid = lastUid;
-        let folderCount = 0;
+        const fetchedCandidates: FetchMessageObject[] = [];
 
         const query = {
           uid: true,
           envelope: true,
-          source: true,
           internalDate: true,
           flags: true,
+          bodyStructure: true,
+          size: true,
         } as const;
         const fetchOpts = { uid: true } as const;
 
-        for await (const msg of client.fetch(`${lastUid + 1}:*`, query, fetchOpts)) {
-          if (!msg.source) continue;
+        const nextUid = Number(mbox.uidNext);
+        const fetchRange: `${number}:*` | `${number}:${number}` =
+          maxPer > 0 && Number.isFinite(nextUid)
+            ? `${Math.max(lastUid + 1, Math.max(lastUid, nextUid - 1) - maxPer * 50 + 1)}:${Math.max(lastUid, nextUid - 1)}`
+            : `${lastUid + 1}:*`;
+
+        if (maxPer > 0 && Number.isFinite(nextUid) && nextUid <= lastUid + 1) {
+          beginWrite(db);
+          upsertFolder(db, path, uidValidity, maxUid);
+          commitWrite(db);
+          options?.flush?.();
+          continue;
+        }
+
+        for await (const msg of client.fetch(fetchRange, query, fetchOpts)) {
+          fetchedCandidates.push(msg);
+        }
+        const fetched = newestFetchedMessages(fetchedCandidates, maxPer);
+
+        beginWrite(db);
+
+        for (const msg of fetched) {
           let bodyText = "";
           let subject: string | null = msg.envelope?.subject ?? null;
           let messageId: string | null = normMessageId(msg.envelope?.messageId);
           let dateSec: number | null = null;
 
-          try {
-            const parsed = await simpleParser(msg.source);
-            bodyText = parsed.text || "";
-            if (!subject && parsed.subject) subject = parsed.subject;
-            if (!messageId && parsed.messageId) messageId = normMessageId(parsed.messageId);
-            const d = parsed.date ?? msg.envelope?.date ?? msg.internalDate;
-            if (d) dateSec = Math.floor(new Date(d).getTime() / 1000);
-          } catch {
-            bodyText = "";
-            const d = msg.envelope?.date ?? msg.internalDate;
-            if (d) dateSec = Math.floor(new Date(d).getTime() / 1000);
+          const d = msg.envelope?.date ?? msg.internalDate;
+          if (d) dateSec = Math.floor(new Date(d).getTime() / 1000);
+
+          const textPart = selectTextBodyPart(msg.bodyStructure);
+          if (textPart) {
+            try {
+              bodyText = await downloadTextPart(client, msg.uid, textPart, cfg.MAIL_MAX_BODY_BYTES);
+            } catch {
+              bodyText = "";
+            }
+          }
+
+          if (!bodyText) {
+            try {
+              bodyText = await downloadTextFromSource(client, msg.uid, cfg.MAIL_MAX_BODY_BYTES);
+            } catch {
+              bodyText = "";
+            }
           }
 
           if (!bodyText && msg.envelope) {
@@ -156,14 +313,14 @@ export async function syncMailboxes(
           });
 
           maxUid = Math.max(maxUid, msg.uid);
-          folderCount++;
           messages_imported++;
-          if (maxPer > 0 && folderCount >= maxPer) break;
         }
 
         upsertFolder(db, path, uidValidity, maxUid);
+        commitWrite(db);
         options?.flush?.();
       } catch (e) {
+        rollbackWrite(db);
         const msg = e instanceof Error ? e.message : String(e);
         errors.push(`${path}: ${msg}`);
       }

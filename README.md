@@ -1,6 +1,6 @@
 ## imcp
 
-Read-only IMAP MCP: mirrors mail into **SQLite (sql.js / WASM)** with an in-memory **MiniSearch** index (SQLite build in sql.js has no FTS5), exposes `**mail_sync`**, `**mail_search`**, `**mail_get**`, `**mail_list_mailboxes**`, `**mail_stats**`. Uses `**EXAMINE` + UID `FETCH**` only (see `mailboxOpen(..., { readOnly: true })`); never `STORE`, `APPEND`, `MOVE`, etc.
+Read-only IMAP MCP: mirrors mail into **SQLite** with **FTS5** search, exposes `**mail_sync`**, `**mail_search`**, `**mail_get**`, `**mail_list_mailboxes**`, `**mail_stats**`. Uses `**EXAMINE` + UID `FETCH**` only (see `mailboxOpen(..., { readOnly: true })`); never `STORE`, `APPEND`, `MOVE`, etc.
 
 ### Requirements
 
@@ -61,9 +61,15 @@ After `npm run build`:
 ### Workflow
 
 1. `**mail_sync**` — pull new UIDs since last run per folder (`UIDVALIDITY` change clears that folder cache).
-2. `**mail_search**` — MiniSearch over cached `subject` + `body_text`. Default splits into words with AND; `**raw_query: true**` uses your string as-is and OR-combines terms.
+2. `**mail_search**` — SQLite FTS5 over cached `subject`, `body_text`, and address fields. Default splits into words with AND, then fills remaining results with a broader OR/prefix fallback; `**raw_query: true**` uses the broader path directly.
 3. `**mail_get**` — full row from SQLite by `id` or `message_id`.
 
 ### Limits
 
-First large sync over IMAP may take time. Use `**MAIL_SYNC_ON_START**` only if startup delay is acceptable, or `**maxMessagesPerFolder**` on `mail_sync` to pace imports.
+First large sync over IMAP may take time. Sync fetches metadata first and downloads the best text body part instead of the full raw message when possible. Use `**MAIL_SYNC_ON_START**` only if startup delay is acceptable, `**maxMessagesPerFolder**` on `mail_sync` to pace imports, and `**MAIL_MAX_BODY_BYTES**` to cap indexed body text per message (default `262144`).
+
+### Maintainer search checks
+
+After `npm run build`:
+
+- `npm run test:db` — fixture checks for SQLite FTS migration/search and body-part selection.

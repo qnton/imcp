@@ -31,6 +31,7 @@ const EnvSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === "1" || v === "true"),
+  MAIL_MAX_BODY_BYTES: z.coerce.number().int().positive().default(262144),
 });
 
 export type Config = Omit<z.infer<typeof EnvSchema>, "MAIL_DATABASE_PATH" | "MAIL_SYNC_ON_START" | "IMAP_SECURE"> & {

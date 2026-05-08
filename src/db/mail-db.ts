@@ -1,8 +1,6 @@
-import initSqlJs, { type Database as SqlJsDatabase, type SqlValue } from "sql.js";
+import Database, { type Database as BetterSqliteDatabase } from "better-sqlite3";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import MiniSearch from "minisearch";
 
 const MIGRATION_SQL = `
 PRAGMA foreign_keys = ON;
@@ -34,156 +32,109 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_folder_uid ON messages (folder_id, uid);
 CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages (message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages (date);
-`;
 
-/** Repo root (`imcp/`): `dist/db` -> `../..` when compiled. */
-function packageRoot(): string {
-  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-}
+CREATE TABLE IF NOT EXISTS imcp_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+  subject,
+  body_text,
+  from_addr,
+  to_addrs,
+  cc_addrs,
+  content='messages',
+  content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, subject, body_text, from_addr, to_addrs, cc_addrs)
+  VALUES (new.id, new.subject, new.body_text, new.from_addr, new.to_addrs, new.cc_addrs);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, subject, body_text, from_addr, to_addrs, cc_addrs)
+  VALUES('delete', old.id, old.subject, old.body_text, old.from_addr, old.to_addrs, old.cc_addrs);
+END;
+
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, subject, body_text, from_addr, to_addrs, cc_addrs)
+  VALUES('delete', old.id, old.subject, old.body_text, old.from_addr, old.to_addrs, old.cc_addrs);
+  INSERT INTO messages_fts(rowid, subject, body_text, from_addr, to_addrs, cc_addrs)
+  VALUES (new.id, new.subject, new.body_text, new.from_addr, new.to_addrs, new.cc_addrs);
+END;
+`;
 
 type SqlParam = string | number | null | undefined;
 
-function bindParams(params: SqlParam[]): SqlValue[] {
-  return params.map((p) => (p === undefined ? null : p) as SqlValue);
+function bindParams(params: SqlParam[]): unknown[] {
+  return params.map((p) => (p === undefined ? null : p));
 }
 
 function stmtGet<T extends Record<string, unknown>>(
-  db: SqlJsDatabase,
+  db: BetterSqliteDatabase,
   sql: string,
-  params: SqlParam[],
+  params: SqlParam[] = [],
 ): T | undefined {
-  const stmt = db.prepare(sql);
-  stmt.bind(bindParams(params));
-  if (!stmt.step()) {
-    stmt.free();
-    return undefined;
-  }
-  const row = stmt.getAsObject() as T;
-  stmt.free();
-  return row;
+  return db.prepare(sql).get(...bindParams(params)) as T | undefined;
 }
 
 function stmtAll<T extends Record<string, unknown>>(
-  db: SqlJsDatabase,
+  db: BetterSqliteDatabase,
   sql: string,
-  params: SqlParam[],
+  params: SqlParam[] = [],
 ): T[] {
-  const stmt = db.prepare(sql);
-  stmt.bind(bindParams(params));
-  const out: T[] = [];
-  while (stmt.step()) {
-    out.push(stmt.getAsObject() as T);
-  }
-  stmt.free();
-  return out;
+  return db.prepare(sql).all(...bindParams(params)) as T[];
 }
 
-function run(db: SqlJsDatabase, sql: string, params: SqlParam[]): void {
-  db.run(sql, bindParams(params));
+function run(db: BetterSqliteDatabase, sql: string, params: SqlParam[] = []): void {
+  db.prepare(sql).run(...bindParams(params));
 }
 
-export type MailDb = SqlJsDatabase;
-
-export type SearchDoc = {
-  id: number;
-  folder_id: number;
-  folder_path: string;
-  uid: number;
-  date: number | null;
-  subject: string;
-  body_text: string;
-  snippet: string | null;
-  message_id: string | null;
-  from_addr: string | null;
-  to_addrs: string | null;
-  cc_addrs: string | null;
-  flags: string | null;
-};
-
-function createSearchIndex(): MiniSearch<SearchDoc> {
-  return new MiniSearch<SearchDoc>({
-    idField: "id",
-    fields: ["subject", "body_text"],
-    storeFields: [
-      "folder_id",
-      "folder_path",
-      "uid",
-      "date",
-      "snippet",
-      "message_id",
-      "from_addr",
-      "to_addrs",
-      "cc_addrs",
-      "flags",
-    ],
-  });
-}
-
-function rowToDoc(r: Record<string, unknown>): SearchDoc & { id: number } {
-  return {
-    id: Number(r.id),
-    folder_id: Number(r.folder_id),
-    folder_path: String(r.folder_path ?? ""),
-    uid: Number(r.uid),
-    date: r.date == null ? null : Number(r.date),
-    subject: String(r.subject ?? ""),
-    body_text: String(r.body_text ?? ""),
-    snippet: r.snippet == null ? null : String(r.snippet),
-    message_id: r.message_id == null ? null : String(r.message_id),
-    from_addr: r.from_addr == null ? null : String(r.from_addr),
-    to_addrs: r.to_addrs == null ? null : String(r.to_addrs),
-    cc_addrs: r.cc_addrs == null ? null : String(r.cc_addrs),
-    flags: r.flags == null ? null : String(r.flags),
-  };
-}
-
-function rebuildSearchIndex(db: SqlJsDatabase, index: MiniSearch<SearchDoc>): void {
-  index.removeAll();
-  const rows = stmtAll<Record<string, unknown>>(
+function assertFts5(db: BetterSqliteDatabase): void {
+  const row = stmtGet<{ ok: number }>(
     db,
-    `SELECT m.id, m.folder_id, m.uid, m.message_id, m.date, m.subject, m.from_addr,
-            m.to_addrs, m.cc_addrs, m.flags, m.body_text, m.snippet, f.path AS folder_path
-     FROM messages m
-     JOIN folders f ON f.id = m.folder_id`,
-    [],
+    `SELECT sqlite_compileoption_used('ENABLE_FTS5') AS ok`,
   );
-  for (const r of rows) {
-    index.add(rowToDoc(r));
+  if (Number(row?.ok ?? 0) !== 1) {
+    throw new Error("SQLite FTS5 is not available in better-sqlite3 build");
   }
 }
+
+function rebuildFtsIfNeeded(db: BetterSqliteDatabase): void {
+  const messageCount = Number(stmtGet<{ c: number }>(db, `SELECT COUNT(*) AS c FROM messages`)?.c ?? 0);
+  const version = stmtGet<{ value: string }>(db, `SELECT value FROM imcp_meta WHERE key = 'fts_schema_version'`)?.value;
+  if (version !== "1" && messageCount > 0) {
+    db.prepare(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`).run();
+  }
+  run(
+    db,
+    `INSERT INTO imcp_meta(key, value) VALUES('fts_schema_version', '1')
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  );
+}
+
+export type MailDb = BetterSqliteDatabase;
 
 export type MailStore = {
-  db: SqlJsDatabase;
+  db: BetterSqliteDatabase;
   flush: () => void;
-  /** Full-text index (MiniSearch); sql.js build has no FTS5. */
-  searchIndex: MiniSearch<SearchDoc>;
 };
 
 export async function openMailDatabase(dbPath: string): Promise<MailStore> {
-  const root = packageRoot();
-  const SQL = await initSqlJs({
-    locateFile: (file: string) => path.join(root, "node_modules", "sql.js", "dist", file),
-  });
-
   const dir = path.dirname(dbPath);
   fs.mkdirSync(dir, { recursive: true });
 
-  const db =
-    fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0
-      ? new SQL.Database(fs.readFileSync(dbPath))
-      : new SQL.Database();
-
+  const db = new Database(dbPath);
+  db.pragma("foreign_keys = ON");
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
+  assertFts5(db);
   db.exec(MIGRATION_SQL);
+  rebuildFtsIfNeeded(db);
 
-  const searchIndex = createSearchIndex();
-  rebuildSearchIndex(db, searchIndex);
-
-  const flush = (): void => {
-    const data = db.export();
-    fs.writeFileSync(dbPath, Buffer.from(data));
-  };
-
-  return { db, flush, searchIndex };
+  return { db, flush: () => undefined };
 }
 
 export type FolderRow = {
@@ -209,17 +160,17 @@ export type MessageRow = {
   snippet: string | null;
 };
 
-export function getFolderByPath(db: SqlJsDatabase, mailboxPath: string): FolderRow | undefined {
+export function getFolderByPath(db: BetterSqliteDatabase, mailboxPath: string): FolderRow | undefined {
   return stmtGet<FolderRow>(db, `SELECT id, path, uidvalidity, last_uid, last_sync_at FROM folders WHERE path = ?`, [
     mailboxPath,
   ]);
 }
 
 export function upsertFolder(
-  db: SqlJsDatabase,
+  db: BetterSqliteDatabase,
   mailboxPath: string,
   uidvalidity: number,
-  last_uid: number,
+  lastUid: number,
 ): FolderRow {
   const ts = Math.floor(Date.now() / 1000);
   run(
@@ -230,11 +181,23 @@ export function upsertFolder(
        uidvalidity = excluded.uidvalidity,
        last_uid = excluded.last_uid,
        last_sync_at = excluded.last_sync_at`,
-    [mailboxPath, uidvalidity, last_uid, ts],
+    [mailboxPath, uidvalidity, lastUid, ts],
   );
   const row = getFolderByPath(db, mailboxPath);
   if (!row) throw new Error(`folder upsert failed: ${mailboxPath}`);
   return row;
+}
+
+export function beginWrite(db: BetterSqliteDatabase): void {
+  db.prepare("BEGIN IMMEDIATE").run();
+}
+
+export function commitWrite(db: BetterSqliteDatabase): void {
+  db.prepare("COMMIT").run();
+}
+
+export function rollbackWrite(db: BetterSqliteDatabase): void {
+  if (db.inTransaction) db.prepare("ROLLBACK").run();
 }
 
 export function setFolderValidityAndResetUid(
@@ -243,10 +206,6 @@ export function setFolderValidityAndResetUid(
   mailboxPath: string,
   uidvalidity: number,
 ): void {
-  const ids = stmtAll<{ id: number }>(store.db, `SELECT id FROM messages WHERE folder_id = ?`, [folderId]);
-  for (const { id } of ids) {
-    if (store.searchIndex.has(id)) store.searchIndex.discard(id);
-  }
   run(store.db, `DELETE FROM messages WHERE folder_id = ?`, [folderId]);
   run(store.db, `UPDATE folders SET uidvalidity = ?, last_uid = 0, last_sync_at = ? WHERE id = ?`, [
     uidvalidity,
@@ -293,46 +252,18 @@ export function insertMessage(
       row.snippet,
     ],
   );
-
-  const got = stmtGet<{ id: number }>(
-    store.db,
-    `SELECT id FROM messages WHERE folder_id = ? AND uid = ?`,
-    [folderId, uid],
-  );
-  if (!got) return;
-
-  const doc: SearchDoc & { id: number } = {
-    id: got.id,
-    folder_id: folderId,
-    folder_path: folderPath,
-    uid,
-    date: row.date,
-    subject: row.subject ?? "",
-    body_text: row.body_text,
-    snippet: row.snippet,
-    message_id: row.message_id,
-    from_addr: row.from_addr,
-    to_addrs: row.to_addrs,
-    cc_addrs: row.cc_addrs,
-    flags: row.flags,
-  };
-  if (store.searchIndex.has(got.id)) {
-    store.searchIndex.replace(doc);
-  } else {
-    store.searchIndex.add(doc);
-  }
+  void folderPath;
 }
 
-export function listFolders(db: SqlJsDatabase): FolderRow[] {
+export function listFolders(db: BetterSqliteDatabase): FolderRow[] {
   return stmtAll<FolderRow>(
     db,
     `SELECT id, path, uidvalidity, last_uid, last_sync_at FROM folders ORDER BY path`,
-    [],
   );
 }
 
 export function getMessageById(
-  db: SqlJsDatabase,
+  db: BetterSqliteDatabase,
   id: number,
 ): (MessageRow & { folder_path: string }) | undefined {
   return stmtGet<MessageRow & { folder_path: string }>(
@@ -347,7 +278,7 @@ export function getMessageById(
 }
 
 export function getMessageByMessageId(
-  db: SqlJsDatabase,
+  db: BetterSqliteDatabase,
   messageId: string,
 ): (MessageRow & { folder_path: string }) | undefined {
   return stmtGet<MessageRow & { folder_path: string }>(
@@ -365,7 +296,68 @@ export function getMessageByMessageId(
 
 export type SearchHit = MessageRow & { folder_path: string; rank: number };
 
-/** MiniSearch query; `raw` passes the string through as a single query (prefix/fuzzy still apply). */
+function ftsTokens(input: string): string[] {
+  return input.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+}
+
+function quoteFtsToken(token: string): string {
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
+function strictFtsQuery(input: string): string {
+  return ftsTokens(input)
+    .map((t) => `${quoteFtsToken(t)}*`)
+    .join(" AND ");
+}
+
+function broadFtsQuery(input: string): string {
+  return ftsTokens(input)
+    .map((t) => `${quoteFtsToken(t)}*`)
+    .join(" OR ");
+}
+
+function searchSql(extraWhere: string): string {
+  return `
+    SELECT m.id, m.folder_id, m.uid, m.message_id, m.date, m.subject, m.from_addr,
+           m.to_addrs, m.cc_addrs, m.flags, m.body_text,
+           COALESCE(NULLIF(snippet(messages_fts, 1, '', '', ' ... ', 24), ''), m.snippet) AS snippet,
+           f.path AS folder_path,
+           bm25(messages_fts) AS rank
+    FROM messages_fts
+    JOIN messages m ON m.id = messages_fts.rowid
+    JOIN folders f ON f.id = m.folder_id
+    WHERE messages_fts MATCH ?
+      ${extraWhere}
+    ORDER BY rank, m.date DESC, m.id DESC
+    LIMIT ?`;
+}
+
+function searchOnce(
+  db: BetterSqliteDatabase,
+  match: string,
+  opts: { mailbox?: string; date_after?: number; date_before?: number; limit: number; excludeIds?: Set<number> },
+): SearchHit[] {
+  const where: string[] = [];
+  const params: SqlParam[] = [match];
+  if (opts.mailbox) {
+    where.push("AND f.path = ?");
+    params.push(opts.mailbox);
+  }
+  if (opts.date_after != null) {
+    where.push("AND m.date IS NOT NULL AND m.date >= ?");
+    params.push(opts.date_after);
+  }
+  if (opts.date_before != null) {
+    where.push("AND m.date IS NOT NULL AND m.date <= ?");
+    params.push(opts.date_before);
+  }
+  params.push(opts.limit);
+
+  const rows = stmtAll<SearchHit>(db, searchSql(where.join("\n")), params);
+  if (!opts.excludeIds?.size) return rows;
+  return rows.filter((r) => !opts.excludeIds?.has(r.id));
+}
+
 export function searchMessages(
   store: MailStore,
   query: string,
@@ -375,30 +367,26 @@ export function searchMessages(
   const raw = query.trim();
   if (!raw) return [];
 
-  const results = store.searchIndex.search(raw, {
-    combineWith: opts.combineWith ?? "AND",
-    prefix: true,
-    fuzzy: 0.2,
-    filter: (r) => {
-      if (opts.mailbox && r.folder_path !== opts.mailbox) return false;
-      if (opts.date_after != null && (r.date == null || r.date < opts.date_after)) return false;
-      if (opts.date_before != null && (r.date == null || r.date > opts.date_before)) return false;
-      return true;
-    },
-  });
+  const firstMatch = opts.combineWith === "OR" ? broadFtsQuery(raw) : strictFtsQuery(raw);
+  if (!firstMatch) return [];
 
-  const hits: SearchHit[] = [];
-  for (const r of results.slice(0, limit)) {
-    const id = r.id as number;
-    const full = getMessageById(store.db, id);
-    if (!full) continue;
-    hits.push({ ...full, rank: r.score });
-  }
-  return hits;
+  const hits = searchOnce(store.db, firstMatch, { ...opts, limit });
+  if (hits.length >= limit || opts.combineWith === "OR") return hits.slice(0, limit);
+
+  const seen = new Set(hits.map((h) => h.id));
+  const fallbackMatch = broadFtsQuery(raw);
+  if (!fallbackMatch || fallbackMatch === firstMatch) return hits;
+
+  const fallback = searchOnce(store.db, fallbackMatch, {
+    ...opts,
+    limit: limit - hits.length,
+    excludeIds: seen,
+  });
+  return [...hits, ...fallback].slice(0, limit);
 }
 
-export function mailStats(db: SqlJsDatabase): { folders: number; messages: number } {
-  const fc = stmtGet<{ c: number }>(db, `SELECT COUNT(*) AS c FROM folders`, []);
-  const mc = stmtGet<{ c: number }>(db, `SELECT COUNT(*) AS c FROM messages`, []);
+export function mailStats(db: BetterSqliteDatabase): { folders: number; messages: number } {
+  const fc = stmtGet<{ c: number }>(db, `SELECT COUNT(*) AS c FROM folders`);
+  const mc = stmtGet<{ c: number }>(db, `SELECT COUNT(*) AS c FROM messages`);
   return { folders: Number(fc?.c ?? 0), messages: Number(mc?.c ?? 0) };
 }

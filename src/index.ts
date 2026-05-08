@@ -11,7 +11,7 @@ import {
   openMailDatabase,
   searchMessages,
 } from "./db/mail-db.js";
-import { keywordsToMiniSearchAnd } from "./fts-query.js";
+import { keywordsToSearchTerms } from "./fts-query.js";
 import { listRemoteMailboxes, syncMailboxes } from "./sync/imap-sync.js";
 
 function jsonText(obj: unknown) {
@@ -77,21 +77,18 @@ async function main() {
     "mail_search",
     {
       description:
-        "Full-text search over cached subject + body (MiniSearch in-process index; sql.js has no FTS5). Default: tokenized AND. raw_query skips tokenization.",
+        "Full-text search over cached subject/body/address fields using SQLite FTS5. Default: tokenized AND with broader fallback. raw_query broadens matching.",
       inputSchema: {
         query: z.string().min(1).describe("Search text; when raw_query=true, passed through as-is"),
         mailbox: z.string().optional().describe("Filter by IMAP folder path"),
         date_after: z.number().int().optional().describe("Unix seconds inclusive lower bound"),
         date_before: z.number().int().optional().describe("Unix seconds inclusive upper bound"),
         limit: z.number().int().positive().max(200).optional(),
-        raw_query: z
-          .boolean()
-          .optional()
-          .describe("If true, use query string as-is (still prefix/fuzzy search)"),
+        raw_query: z.boolean().optional().describe("If true, use broader OR-style matching"),
       },
     },
     async (args) => {
-      const match = args.raw_query ? args.query : keywordsToMiniSearchAnd(args.query);
+      const match = args.raw_query ? args.query : keywordsToSearchTerms(args.query);
       try {
         const hits = searchMessages(store, match, {
           mailbox: args.mailbox,
