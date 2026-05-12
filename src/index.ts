@@ -10,9 +10,15 @@ import {
   mailStats,
   openMailDatabase,
   searchMessages,
+  updateMessageBody,
 } from "./db/mail-db.js";
 import { keywordsToSearchTerms } from "./fts-query.js";
-import { listRemoteMailboxes, syncMailboxes } from "./sync/imap-sync.js";
+import {
+  fetchFullMessage,
+  listRemoteMailboxes,
+  snippetFromText,
+  syncMailboxes,
+} from "./sync/imap-sync.js";
 
 function jsonText(obj: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] };
@@ -137,6 +143,39 @@ async function main() {
       }
       if (!row) return jsonText({ error: "Not found in cache (run mail_sync)" });
       return jsonText(row);
+    },
+  );
+
+  mcp.registerTool(
+    "mail_get_full",
+    {
+      description:
+        "Fetch the full message body from IMAP and update cache. Use this when the cached body is truncated or empty.",
+      inputSchema: {
+        id: z.number().int().positive().optional(),
+        message_id: z.string().optional(),
+      },
+    },
+    async (args) => {
+      if (!args.id && !args.message_id) {
+        return jsonText({ error: "Provide id or message_id" });
+      }
+      let row = args.id != null ? getMessageById(db, args.id) : undefined;
+      if (!row && args.message_id) {
+        const mid = args.message_id.trim().replace(/^<|>$/g, "");
+        row = getMessageByMessageId(db, mid.includes("@") ? mid : args.message_id.trim());
+      }
+      if (!row) return jsonText({ error: "Not found in cache (run mail_sync)" });
+
+      try {
+        const fullBody = await fetchFullMessage(cfg, row.folder_path, row.uid);
+        const snippet = snippetFromText(fullBody || row.subject || "");
+        updateMessageBody(db, row.id, fullBody, snippet);
+        flush();
+        return jsonText({ ...row, body_text: fullBody, snippet });
+      } catch (e) {
+        return jsonText({ error: e instanceof Error ? e.message : String(e) });
+      }
     },
   );
 

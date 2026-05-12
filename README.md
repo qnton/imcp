@@ -7,6 +7,7 @@ It exposes:
 - `mail_sync` - sync new messages from IMAP into SQLite
 - `mail_search` - search cached subject, body, and address fields
 - `mail_get` - fetch a cached message by SQLite id or Message-ID
+- `mail_get_full` - fetch the full message body from IMAP and update cache
 - `mail_list_mailboxes` - list IMAP folders or cached folders
 - `mail_stats` - show cache counts and database path
 

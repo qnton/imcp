@@ -27,7 +27,7 @@ function flagsToString(flags: Set<string> | undefined): string | null {
   return JSON.stringify([...flags].sort());
 }
 
-function snippetFromText(text: string, max = 240): string {
+export function snippetFromText(text: string, max = 240): string {
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length <= max) return t;
   return `${t.slice(0, max)}...`;
@@ -123,7 +123,9 @@ export function htmlToText(html: string): string {
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
     .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/(p|div|li|tr|h[1-6])>/gi, "\n")
+    .replace(/<\/(p|div|li|h[1-6])>/gi, "\n")
+    .replace(/<tr\b[^>]*>/gi, "\n")
+    .replace(/<(td|th)\b[^>]*>/gi, "  - ") // Use bullet to ensure indentation is preserved
     .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
@@ -131,7 +133,9 @@ export function htmlToText(html: string): string {
     .replace(/&gt;/gi, ">")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\n+/g, "\n\n")
     .trim();
 }
 
@@ -139,7 +143,7 @@ async function downloadTextPart(
   client: ImapFlow,
   uid: number,
   part: TextPart,
-  maxBytes: number,
+  maxBytes?: number,
 ): Promise<string> {
   const downloaded = await client.download(String(uid), part.part, { uid: true, maxBytes });
   if (!downloaded.content) return "";
@@ -150,9 +154,13 @@ async function downloadTextPart(
 async function downloadTextFromSource(
   client: ImapFlow,
   uid: number,
-  maxBytes: number,
+  maxBytes?: number,
 ): Promise<string> {
-  const msg = await client.fetchOne(String(uid), { source: { start: 0, maxLength: maxBytes } }, { uid: true });
+  const msg = await client.fetchOne(
+    String(uid),
+    { source: maxBytes != null ? { start: 0, maxLength: maxBytes } : true },
+    { uid: true },
+  );
   const source = msg && "source" in msg ? msg.source : undefined;
   return source ? textFromMessageSource(source) : "";
 }
@@ -342,6 +350,55 @@ export async function syncMailboxes(
     messages_imported,
     errors,
   };
+}
+
+export async function fetchFullMessage(
+  cfg: Config,
+  mailboxPath: string,
+  uid: number,
+): Promise<string> {
+  const client = new ImapFlow({
+    host: cfg.IMAP_HOST,
+    port: cfg.IMAP_PORT,
+    secure: cfg.IMAP_SECURE,
+    auth: { user: cfg.IMAP_USER, pass: cfg.IMAP_PASSWORD },
+    logger: false,
+  });
+
+  try {
+    await client.connect();
+    await client.mailboxOpen(mailboxPath, { readOnly: true });
+
+    const msg = await client.fetchOne(String(uid), { bodyStructure: true }, { uid: true });
+    if (!msg) throw new Error("Message not found on server");
+
+    const textPart = selectTextBodyPart(msg.bodyStructure);
+    let bodyText = "";
+
+    if (textPart) {
+      try {
+        bodyText = await downloadTextPart(client, uid, textPart);
+      } catch {
+        bodyText = "";
+      }
+    }
+
+    if (!bodyText) {
+      try {
+        bodyText = await downloadTextFromSource(client, uid);
+      } catch {
+        bodyText = "";
+      }
+    }
+
+    return bodyText;
+  } finally {
+    try {
+      await client.logout();
+    } catch {
+      client.close();
+    }
+  }
 }
 
 export async function listRemoteMailboxes(cfg: Config): Promise<{ paths: string[]; error?: string }> {

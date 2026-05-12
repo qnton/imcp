@@ -255,6 +255,15 @@ export function insertMessage(
   void folderPath;
 }
 
+export function updateMessageBody(
+  db: BetterSqliteDatabase,
+  id: number,
+  bodyText: string,
+  snippet: string | null,
+): void {
+  run(db, `UPDATE messages SET body_text = ?, snippet = ? WHERE id = ?`, [bodyText, snippet, id]);
+}
+
 export function listFolders(db: BetterSqliteDatabase): FolderRow[] {
   return stmtAll<FolderRow>(
     db,
